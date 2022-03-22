@@ -1,0 +1,240 @@
+pool:
+  vmImage: 'ubuntu-20.04'
+  name: Azure Pipelines
+
+variables:
+- name: app_version
+  value: "1.0"
+
+stages:
+- stage: build_publish_stage
+  displayName: 'Build & Publish Stage'
+
+  jobs:
+  - job: Build_Publish_MVN_docker
+    displayName: 'Build and Publish for MVN and Docker'
+    variables:
+      MAVEN_CACHE_FOLDER: $(Pipeline.Workspace)/.m2/repository
+      MAVEN_OPTS: '-Dmaven.repo.local=$(MAVEN_CACHE_FOLDER)'
+
+    steps:
+    - task: MavenAuthenticate@0
+      inputs:
+        artifactsFeeds: 'distill-maven-repo'
+
+    - task: MavenAuthenticate@0
+      inputs:
+        artifactsFeeds: 'distill-maven-repo'
+
+    - task: Cache@2
+      inputs:
+        key: 'maven | "$(Agent.OS)" | **/pom.xml'
+        restoreKeys: |
+          maven | "$(Agent.OS)"
+          maven
+        path: $(MAVEN_CACHE_FOLDER)
+      displayName: Cache Maven local repo     
+      
+    # - task: SonarQubePrepare@4
+    #   inputs:
+    #     SonarQube: 'azure-sonarqube'
+    #     scannerMode: 'Other'
+    #     extraProperties: |
+    #       # Additional properties that will be passed to the scanner, 
+    #       # Put one key=value per line, example:
+    #       # sonar.exclusions=**/*.bin
+    #       sonar.projectName=forms
+    #       sonar.projectKey=forms
+
+    - task: Maven@3
+      inputs:
+        mavenPomFile: 'pom.xml'
+        publishJUnitResults: false
+        javaHomeOption: 'JDKVersion'
+        mavenVersionOption: 'Default'
+        mavenOptions: '-Xmx1024m $(MAVEN_OPTS)'
+        mavenAuthenticateFeed: false
+        effectivePomSkip: false
+    #     sonarQubeRunAnalysis: true
+    #     sqMavenPluginVersionChoice: 'latest'
+    #     checkStyleRunAnalysis: true
+    #     pmdRunAnalysis: true
+    #     findBugsRunAnalysis: true
+    
+    # - task: SonarCloudPublish@1
+    #   inputs:
+    #     pollingTimeoutSec: '300'
+
+    
+    - task: Docker@2
+      inputs:
+        repository: 'forms-docker'
+        command: 'build'
+        Dockerfile: 'Dockerfile'
+        tags: 'latest'
+
+    - task: PublishBuildArtifacts@1
+      inputs:
+        PathtoPublish: '$(Build.SourcesDirectory)/webapp/target/forms.jar'
+        ArtifactName: 'Forms Jar'
+
+    - task: ECRPushImage@1
+      inputs:
+        awsCredentials: 'aws_service_connection'
+        regionName: 'ap-south-1'
+        imageSource: 'imagename'
+        sourceImageName: 'forms-docker'
+        repositoryName: 'forms'
+        pushTag: '$(Build.SourceBranchName)-$(app_version).$(Build.BuildId)'
+
+    - task: ECRPushImage@1
+      inputs:
+        awsCredentials: 'aws_service_connection_uat'
+        regionName: 'eu-west-2'
+        imageSource: 'imagename'
+        sourceImageName: 'forms-docker'
+        repositoryName: 'forms'
+        pushTag: '$(Build.SourceBranchName)-$(app_version).$(Build.BuildId)'    
+
+- stage: deploy_to_ecs_qa
+  displayName: 'Deploy To ECS QA'
+  variables:
+    - group: "Forms-QA-MVP"
+  jobs:
+  - deployment: deployformsapiqa
+    displayName:  "Deployment for Forms API in QA"
+    environment: 'Forms-QA-MVP'
+    strategy:
+      runOnce:
+       deploy:
+        steps:
+        - checkout: none
+
+        - task: AWSShellScript@1
+          inputs:
+            awsCredentials: 'aws_service_connection'
+            regionName: 'ap-south-1'
+            scriptType: 'inline'
+            inlineScript: |
+                TASK_DEFINITION=$(aws ecs describe-task-definition --task-definition '$(ECS_TASK_DEF_NAME)')
+              
+                NEW_TASK_DEFINTIION=$(echo $TASK_DEFINITION | jq --arg IMAGE "$(DOCKER_REPO_NAME):$(Build.SourceBranchName)-$(app_version).$(Build.BuildId)" '.taskDefinition | .containerDefinitions[0].image = $IMAGE | del(.taskDefinitionArn) | del(.revision) | del(.status) | del(.requiresAttributes) | del(.compatibilities) | del(.registeredAt) | del(.registeredBy)')
+
+                NEW_TASK_INFO=$(aws ecs register-task-definition --cli-input-json "$NEW_TASK_DEFINTIION")
+
+                NEW_REVISION=$(echo $NEW_TASK_INFO | jq '.taskDefinition.revision')
+
+                aws ecs update-service --cluster $(ECS_CLUSTER_NAME) \
+                          --service $(ECS_SERVICE_NAME) \
+                          --task-definition $(ECS_TASK_DEF_NAME):${NEW_REVISION}
+            failOnStandardError: true
+
+
+- stage: deploy_to_ecs_uat
+  displayName: 'Deploy To ECS UAT'
+  variables:
+   - group: "Forms-UAT-MVP"
+  jobs:
+  - deployment: deployformsapi
+    displayName:  "Deployment for Forms API in UAT"
+    environment: 'Forms-UAT-MVP'
+    strategy:
+      runOnce:
+       deploy:
+        steps:
+        - checkout: none
+
+        - task: AWSShellScript@1
+          inputs:
+            awsCredentials: 'aws_service_connection_uat'
+            regionName: 'eu-west-2'
+            scriptType: 'inline'
+            inlineScript: |
+                TASK_DEFINITION=$(aws ecs describe-task-definition --task-definition '$(ECS_TASK_DEF_NAME)')
+              
+                NEW_TASK_DEFINTIION=$(echo $TASK_DEFINITION | jq --arg IMAGE "$(DOCKER_REPO_NAME):$(Build.SourceBranchName)-$(app_version).$(Build.BuildId)" '.taskDefinition | .containerDefinitions[0].image = $IMAGE | del(.taskDefinitionArn) | del(.revision) | del(.status) | del(.requiresAttributes) | del(.compatibilities) | del(.registeredAt) | del(.registeredBy)')
+
+                NEW_TASK_INFO=$(aws ecs register-task-definition --cli-input-json "$NEW_TASK_DEFINTIION")
+
+                NEW_REVISION=$(echo $NEW_TASK_INFO | jq '.taskDefinition.revision')
+
+                aws ecs update-service --cluster $(ECS_CLUSTER_NAME) \
+                          --service $(ECS_SERVICE_NAME) \
+                          --task-definition $(ECS_TASK_DEF_NAME):${NEW_REVISION}
+            failOnStandardError: true
+
+
+- stage: deploy_to_preprod
+  displayName: 'Deploy To PreProd'
+  jobs:
+  - deployment: deploytopreprod
+    displayName:  "Deploy To PreProd"
+    environment: 'Forms Deploy To PreProd'
+    strategy:
+      runOnce:
+       deploy:
+        steps:
+        - checkout: none
+        - script: echo "Test"
+
+- stage: deploy_to_prod
+  displayName: 'Deploy To Prod'
+  variables:
+    - group: "Forms-Prod-MVP"  
+  jobs:
+  - deployment: deploytoprod
+    displayName:  "Deploy To Prod"
+    environment: 'Forms Deploy To Prod'
+    strategy:
+      runOnce:
+       deploy:
+        steps:
+        - checkout: none
+
+        - task: AWSShellScript@1
+          inputs:
+            awsCredentials: 'aws_service_connection_uat'
+            regionName: 'eu-west-2'
+            scriptType: 'inline'
+            inlineScript: |
+                TASK_DEFINITION=$(aws ecs describe-task-definition --task-definition '$(ECS_TASK_DEF_NAME)')
+              
+                NEW_TASK_DEFINTIION=$(echo $TASK_DEFINITION | jq --arg IMAGE "$(DOCKER_REPO_NAME):$(Build.SourceBranchName)-$(app_version).$(Build.BuildId)" '.taskDefinition | .containerDefinitions[0].image = $IMAGE | del(.taskDefinitionArn) | del(.revision) | del(.status) | del(.requiresAttributes) | del(.compatibilities) | del(.registeredAt) | del(.registeredBy)')
+
+                NEW_TASK_INFO=$(aws ecs register-task-definition --cli-input-json "$NEW_TASK_DEFINTIION")
+
+                NEW_REVISION=$(echo $NEW_TASK_INFO | jq '.taskDefinition.revision')
+
+                aws ecs update-service --cluster $(ECS_CLUSTER_NAME) \
+                          --service $(ECS_SERVICE_NAME) \
+                          --task-definition $(ECS_TASK_DEF_NAME):${NEW_REVISION}
+            failOnStandardError: true
+
+- stage: RiseMR
+  displayName: 'Rise An MR'
+  pool:
+   vmImage: windows-2022
+  jobs:
+  - job: rise_an_mr
+    displayName: 'Rise an MR'
+    steps:
+     
+    - task: CreatePullRequest@1
+      inputs:
+        repoType: 'Azure DevOps'
+        repositorySelector: 'currentBuild'
+        sourceBranch: '$(Build.SourceBranch)'
+        targetBranch: 'master'
+        title: 'MR Raised by Azure DevOps Release Pipeline For  Releases'
+        linkWorkItems: false
+        alwaysCreatePr: true
+
+    - task: CreatePullRequest@1
+      inputs:
+        repoType: 'Azure DevOps'
+        repositorySelector: 'currentBuild'
+        sourceBranch: '$(Build.SourceBranch)'
+        targetBranch: 'hotfix'
+        title: 'MR Raised by Azure DevOps Release Pipeline For  Releases'
+        linkWorkItems: false
+        alwaysCreatePr: true
